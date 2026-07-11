@@ -1,0 +1,142 @@
+\subsection{Implementação do firmware}
+
+O firmware implementa o controle digital de velocidade do motor CC em um ESP32
+(NodeMCU-32S), com PlatformIO e framework Arduino. O núcleo do sistema é um loop
+de controle executado a cada \textbf{10~ms}, sincronizado com o período de
+amostragem $T_s$ do controlador PI. Essa taxa fixa garante que a discretização
+do controlador (método de Tustin) corresponda ao tempo real entre amostras.
+
+\subsubsection{Arquitetura e fluxo de execução}
+
+O código está organizado em cinco módulos: \texttt{main.cpp} (orquestração),
+\texttt{sensores.cpp} (aquisição), \texttt{controleMotorCC.cpp} (PI e ponte~H),
+\texttt{inputs.cpp} (botões) e \texttt{displayOled.cpp} (OLED).
+
+O ESP32 possui dois núcleos, explorados da seguinte forma:
+\begin{itemize}
+  \item \textbf{Core~1 -- \texttt{loop()}:} tarefa crítica em tempo real. A cada
+        10~ms lê os botões, obtém a velocidade medida, executa o PI e atualiza o
+        PWM do motor.
+  \item \textbf{Core~0 -- \texttt{displayTask()}:} tarefa de interface. A cada
+        100~ms lê corrente e tensão no ADS1115 e atualiza o display, sem bloquear
+        o loop de controle.
+\end{itemize}
+
+Variáveis globais (\texttt{g\_velocidade}, \texttt{g\_corrente}, \texttt{g\_tensao},
+\texttt{g\_spdisplay}) compartilham os valores entre os núcleos.
+
+A sequência de cada ciclo de controle no \texttt{main.cpp} é:
+\begin{enumerate}
+  \item verificar se o módulo de potência está conectado;
+  \item ler as entradas do usuário e informar o sentido esperado na partida;
+  \item medir a velocidade atual (\texttt{VelocidadeMotor});
+  \item aplicar o PI (\texttt{controleMotor}) ou parar o motor, se a referência
+        for zero e a velocidade estiver abaixo de 2~RPM.
+\end{enumerate}
+
+\subsubsection{Interface com o usuário}
+
+A referência de velocidade é ajustada por três botões com \textit{pull-up} interno:
+\textbf{UP} e \textbf{DOWN} alteram \texttt{setvel} (valor em edição, limitado a
+$\pm 12\,000$~RPM) e \textbf{SET} confirma \texttt{setvel} como \texttt{setpoint}
+(referência efetiva do PI). O incremento é adaptativo: 100~RPM a cada 200~ms no
+início e 1000~RPM a cada 300~ms após 5~s de botão pressionado, facilitando ajustes
+rápidos sem perder precisão em baixas velocidades.
+
+O display SSD1306 exibe velocidade filtrada, corrente, tensão, potência elétrica
+($P = V \cdot I$), a referência em ajuste e um ícone indicando o sentido de rotação.
+
+\subsubsection{Medição de velocidade -- núcleo do algoritmo de sensores}
+
+A estimativa de velocidade é o ponto mais crítico do firmware, pois alimenta
+diretamente o controlador. Utiliza-se um \textbf{método híbrido}, pois nenhuma
+técnica isolada funciona bem em toda a faixa de rotação do motor.
+
+\paragraph{Sensor de módulo (velocidade).}
+Um encoder com 100 furos gera pulsos em interrupção (\texttt{FALLING}). A ISR
+conta os pulsos na janela de 10~ms e mede o \textbf{período entre pulsos}
+consecutivos ($\mu$s), armazenado em \texttt{periodoPulsoModulo}.
+
+\paragraph{Estimativa por período} (baixa rotação):
+\begin{equation}
+  \text{RPM} = \frac{60 \times 10^{6}}{\text{periodo} \times N\_\text{FUROS}}
+\end{equation}
+Precisa quando há poucos pulsos por janela, evitando degraus grandes na leitura.
+
+\paragraph{Estimativa por janela} (média/alta rotação):
+\begin{equation}
+  \text{RPM} = \frac{N_\text{pulsos} \times 60}{\Delta t \times N\_\text{FUROS}}
+\end{equation}
+Mais estável quando há muitos pulsos em $\Delta t \approx 10$~ms.
+
+\paragraph{Seleção automática.}
+Se a estimativa por período for menor que \texttt{LIMIAR\_LEITURA\_RPM} (2000~RPM),
+usa-se o período; caso contrário, usa-se a contagem na janela.
+
+\paragraph{Timeout do último pulso.}
+Em baixa rotação é comum \textbf{não receber pulso} em toda janela de 10~ms, o que
+não significa que o motor parou. O firmware calcula há quanto tempo ocorreu o último
+pulso (\texttt{idadePulso}) e compara com um \texttt{timeout} proporcional ao último
+período medido (3$\times$ o período, limitado entre 30~ms e 300~ms). Enquanto o pulso
+for recente, mantém-se a RPM estimada pelo período; se expirar, aplica-se decaimento
+gradual (\texttt{RPM\_DECAIMENTO} $= 0{,}85$) até zerar.
+
+\paragraph{Sentido de rotação (quadratura).}
+Dois sensores A e B medem atrasos entre bordas para determinar o sentido. A
+velocidade final é $\text{rpm\_raw} = \text{sentido} \times |\text{RPM}|$.
+Na partida, com o motor parado ($|\text{RPM}| < 2$), o sentido vem da referência
+selecionada pelo usuário --- e não da quadratura --- para evitar inversão por ruído.
+A quadratura só corrige o sentido quando há pulsos de velocidade e o motor já gira.
+
+\paragraph{Filtro.}
+A leitura final passa por média exponencial (\texttt{RPM\_FILT} $= 0{,}35$) para
+atenuar ruído e degraus sem tornar a resposta lenta demais para o PI.
+
+\subsubsection{Controlador PI discreto}
+
+O motor é acionado por um controlador \textbf{PI} (sem ação derivativa), discretizado
+pelo \textbf{método de Tustin} (transformação bilinear), que preserva melhor a
+dinâmica do controlador contínuo do que a Euler para frente. Os ganhos projetados
+em tempo contínuo são $K_p = 1{,}02$ e $K_i = 30$.
+
+O erro é normalizado por \texttt{PAD\_IN} $= 1000$ para manter a saída do PI em
+faixa adequada:
+\begin{equation}
+  e[k] = \frac{\text{setpoint} - \text{velocidade medida}}{1000}
+\end{equation}
+
+A implementação usa a forma \textbf{incremental}, adequada ao acionamento por PWM:
+\begin{equation}
+  u[k] = u[k-1] + \left(K_p + \frac{K_i T_s}{2}\right) e[k]
+               + \left(-K_p + \frac{K_i T_s}{2}\right) e[k-1]
+\end{equation}
+
+A saída $u[k]$ representa a tensão de armadura normalizada, limitada a $\pm 12$,
+e é convertida em duty cycle PWM ($\times$ \texttt{PAD\_PWM}) para acionar a
+ponte~H a 25~kHz: $u > 0$ aciona um sentido; $u < 0$, o sentido oposto, com apenas
+um braço ativo por vez.
+
+Ao parar o motor, os estados internos do PI (\texttt{error}, \texttt{output}) são
+zerados para evitar \textit{windup} de integral na próxima partida.
+
+\subsubsection{Leitura de corrente e tensão}
+
+Corrente e tensão são adquiridas pelo conversor ADS1115 via I\textsuperscript{2}C.
+A corrente é lida de forma diferencial nos canais 0--3 (shunt de 0,018~$\Omega$,
+ganho $\times$16). A tensão é lida no canal A1, corrigida por divisor resistivo
+(5,1~k$\Omega$ / 47~k$\Omega$). Ambas passam por filtro exponencial (peso 0,70 na
+leitura anterior) e são exibidas no OLED; não entram diretamente no loop de
+velocidade, mas permitem monitorar o regime de operação do motor.
+
+\subsubsection{Proteções e condições de parada}
+
+\begin{itemize}
+  \item \textbf{Módulo desconectado:} detectado pelo pino GPIO~17; o motor é
+        desligado, variáveis zeradas e entradas/PI resetados.
+  \item \textbf{Reconexão:} mesmo reset completo antes de retomar, evitando partida
+        com estados residuais.
+  \item \textbf{Referência nula:} se \texttt{setpoint} $= 0$ e $|\text{velocidade}| < 2$~RPM,
+        o motor é parado e o PI é zerado.
+  \item \textbf{Banda morta:} velocidades residuais abaixo de 2~RPM são forçadas a
+        zero no sensor, evitando que o PI trabalhe com erro fictício.
+\end{itemize}
